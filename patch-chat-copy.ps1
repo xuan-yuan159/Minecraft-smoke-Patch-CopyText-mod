@@ -34,7 +34,7 @@ $asmExports = @(
     "--add-exports=java.base/jdk.internal.org.objectweb.asm.tree=ALL-UNNAMED"
 )
 
-& javac -encoding UTF-8 -source 8 -target 8 -d $buildDirectory (Join-Path $sourceDirectory "ChatCopyHook.java")
+& javac -encoding UTF-8 -source 8 -target 8 -d $buildDirectory (Join-Path $sourceDirectory "ChatCopyHook.java") (Join-Path $sourceDirectory "AutoGGHook.java")
 
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

@@ -45,12 +45,17 @@ public final class PatchSmokeChatCopy {
     private static final String EXPECTED_SHA256 = "C600FD3C23FB95437B76CA7AC83EA60A26832BECB3796ED9F47DC519EF541CCD"; // 唯一允许处理的原始 Smoke 客户端摘要
     private static final String CHAT_INPUT_ENTRY = "net/minecraft/client/gui/GuiChat.class"; // 聊天鼠标点击入口类
     private static final String CHAT_LOOKUP_ENTRY = "net/minecraft/client/gui/GuiNewChat.class"; // 聊天组件命中入口类
-    private static final String HOOK_CLASS_NAME = "ChatCopyHook"; // 写入客户端的运行时钩子类名
+    private static final String AUTO_GG_ENTRY = "icu/hanabi/smoke/module/collection/module/AutoGG.class"; // Smoke 内置 AutoGG 模块类
+    private static final String CHAT_COPY_HOOK_CLASS_NAME = "ChatCopyHook"; // 写入客户端的聊天复制运行时钩子类名
+    private static final String AUTO_GG_HOOK_CLASS_NAME = "AutoGGHook"; // 写入客户端的 AutoGG 运行时钩子类名
     private static final String MOUSE_CLICK_METHOD_NAME = "mouseClicked"; // GuiChat 鼠标点击方法名称
     private static final String MOUSE_CLICK_METHOD_DESCRIPTOR = "(III)V"; // GuiChat 鼠标点击方法描述符
     private static final String CHAT_LOOKUP_METHOD_NAME = "getChatComponent"; // GuiNewChat 消息命中方法名称
     private static final String CHAT_LOOKUP_METHOD_DESCRIPTOR = "(II)Lnet/minecraft/util/IChatComponent;"; // GuiNewChat 消息命中方法描述符
-    private static final String HOOK_OWNER = HOOK_CLASS_NAME; // 默认包运行时钩子的 JVM 所有者名称
+    private static final String AUTO_GG_METHOD_NAME = "onGG"; // AutoGG 聊天事件方法名称
+    private static final String AUTO_GG_METHOD_DESCRIPTOR = "(Licu/hanabi/smoke/events/Misc/EventChat;)V"; // AutoGG 聊天事件方法描述符
+    private static final String CHAT_COPY_HOOK_OWNER = CHAT_COPY_HOOK_CLASS_NAME; // 默认包聊天复制钩子的 JVM 所有者名称
+    private static final String AUTO_GG_HOOK_OWNER = AUTO_GG_HOOK_CLASS_NAME; // 默认包 AutoGG 钩子的 JVM 所有者名称
     private static final int LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50; // ZIP 本地文件头标识
     private static final int CENTRAL_DIRECTORY_SIGNATURE = 0x02014B50; // ZIP 中央目录项标识
     private static final int END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054B50; // ZIP 中央目录结束标识
@@ -109,13 +114,15 @@ public final class PatchSmokeChatCopy {
         RawZipArchive archive = RawZipArchive.read(inputJar);
         RawZipEntry chatInputEntry = archive.getEntry(CHAT_INPUT_ENTRY);
         RawZipEntry chatLookupEntry = archive.getEntry(CHAT_LOOKUP_ENTRY);
+        RawZipEntry autoGGEntry = archive.getEntry(AUTO_GG_ENTRY);
 
-        if (chatInputEntry == null || chatLookupEntry == null) {
+        if (chatInputEntry == null || chatLookupEntry == null || autoGGEntry == null) {
             throw new IOException("Required Smoke chat classes are missing.");
         }
 
         verifyTargetClass(archive.readEntry(chatInputEntry), CHAT_INPUT_ENTRY, MOUSE_CLICK_METHOD_NAME, MOUSE_CLICK_METHOD_DESCRIPTOR);
         verifyTargetClass(archive.readEntry(chatLookupEntry), CHAT_LOOKUP_ENTRY, CHAT_LOOKUP_METHOD_NAME, CHAT_LOOKUP_METHOD_DESCRIPTOR);
+        verifyTargetClass(archive.readEntry(autoGGEntry), AUTO_GG_ENTRY, AUTO_GG_METHOD_NAME, AUTO_GG_METHOD_DESCRIPTOR);
         return archive;
     }
 
@@ -143,8 +150,8 @@ public final class PatchSmokeChatCopy {
             throw new IOException("Missing target method " + methodName + methodDescriptor + " in " + entryName);
         }
 
-        if (containsHookInvocation(targetMethod, "tryCopy") || containsHookInvocation(targetMethod, "rememberCandidateLine")) {
-            throw new IOException("Chat copy hook is already present in " + entryName);
+        if (containsRuntimeHookInvocation(targetMethod)) {
+            throw new IOException("Runtime hook is already present in " + entryName);
         }
     }
 
@@ -162,9 +169,11 @@ public final class PatchSmokeChatCopy {
 
         List<Path> classFiles = new ArrayList<Path>();
 
-        try (java.nio.file.DirectoryStream<Path> directoryStream = Files.newDirectoryStream(hookClassDirectory, HOOK_CLASS_NAME + "*.class")) {
+        try (java.nio.file.DirectoryStream<Path> directoryStream = Files.newDirectoryStream(hookClassDirectory, "*.class")) {
             for (Path classFile : directoryStream) {
-                classFiles.add(classFile);
+                if (isRuntimeHookClass(classFile.getFileName().toString())) {
+                    classFiles.add(classFile);
+                }
             }
         }
 
@@ -188,11 +197,23 @@ public final class PatchSmokeChatCopy {
             hookClasses.put(classFile.getFileName().toString(), Files.readAllBytes(classFile));
         }
 
-        if (!hookClasses.containsKey(HOOK_CLASS_NAME + ".class")) {
-            throw new IOException("Missing compiled hook class in: " + hookClassDirectory);
+        if (!hookClasses.containsKey(CHAT_COPY_HOOK_CLASS_NAME + ".class")
+                || !hookClasses.containsKey(AUTO_GG_HOOK_CLASS_NAME + ".class")) {
+            throw new IOException("Missing compiled runtime hook class in: " + hookClassDirectory);
         }
 
         return hookClasses;
+    }
+
+    /**
+     * 判断编译产物是否属于需要写入客户端的运行时钩子类。
+     *
+     * @param fileName 编译后的类文件名称
+     * @return 是否为聊天复制或 AutoGG 钩子及其内部类
+     */
+    private static boolean isRuntimeHookClass(String fileName) {
+        return fileName.startsWith(CHAT_COPY_HOOK_CLASS_NAME)
+                || fileName.startsWith(AUTO_GG_HOOK_CLASS_NAME);
     }
 
     /**
@@ -221,8 +242,10 @@ public final class PatchSmokeChatCopy {
     private static void writePatchedOutput(RawZipArchive archive, Map<String, byte[]> hookClasses, Path outputJar) throws Exception {
         RawZipEntry chatInputEntry = archive.getEntry(CHAT_INPUT_ENTRY);
         RawZipEntry chatLookupEntry = archive.getEntry(CHAT_LOOKUP_ENTRY);
+        RawZipEntry autoGGEntry = archive.getEntry(AUTO_GG_ENTRY);
         chatInputEntry.replace( transformChatInput(archive.readEntry(chatInputEntry)) );
         chatLookupEntry.replace( transformChatComponentLookup(archive.readEntry(chatLookupEntry)) );
+        autoGGEntry.replace(transformAutoGG(archive.readEntry(autoGGEntry)));
 
         List<RawZipEntry> appendedEntries = new ArrayList<RawZipEntry>();
 
@@ -263,7 +286,7 @@ public final class PatchSmokeChatCopy {
             throw new IOException("Missing chat click method in " + CHAT_INPUT_ENTRY);
         }
 
-        if (containsHookInvocation(mouseClickMethod, "tryCopy")) {
+        if (containsHookInvocation(mouseClickMethod, CHAT_COPY_HOOK_OWNER, "tryCopy")) {
             throw new IOException("Chat copy hook is already present in " + CHAT_INPUT_ENTRY);
         }
 
@@ -291,11 +314,39 @@ public final class PatchSmokeChatCopy {
             throw new IOException("Missing chat lookup method in " + CHAT_LOOKUP_ENTRY);
         }
 
-        if (containsHookInvocation(lookupMethod, "rememberCandidateLine")) {
+        if (containsHookInvocation(lookupMethod, CHAT_COPY_HOOK_OWNER, "rememberCandidateLine")) {
             throw new IOException("Hovered chat line hook is already present in " + CHAT_LOOKUP_ENTRY);
         }
 
         injectCandidateLineTracking(lookupMethod);
+
+        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+        classNode.accept(writer);
+        return writer.toByteArray();
+    }
+
+    /**
+     * 在 Smoke AutoGG 事件入口注入遗漏 Hypixel 结算规则处理。
+     *
+     * @param originalClass 原始 AutoGG 模块类字节码
+     * @return 注入后的 AutoGG 模块类字节码
+     * @throws IOException 目标方法不存在或已被注入时抛出异常
+     */
+    private static byte[] transformAutoGG(byte[] originalClass) throws IOException {
+        ClassReader reader = new ClassReader(originalClass);
+        ClassNode classNode = new ClassNode();
+        reader.accept(classNode, ClassReader.EXPAND_FRAMES);
+        MethodNode autoGGMethod = findMethod(classNode, AUTO_GG_METHOD_NAME, AUTO_GG_METHOD_DESCRIPTOR);
+
+        if (autoGGMethod == null) {
+            throw new IOException("Missing AutoGG event method in " + AUTO_GG_ENTRY);
+        }
+
+        if (containsHookInvocation(autoGGMethod, AUTO_GG_HOOK_OWNER, "trySend")) {
+            throw new IOException("AutoGG hook is already present in " + AUTO_GG_ENTRY);
+        }
+
+        injectAutoGGHandling(classNode, autoGGMethod);
 
         ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
         classNode.accept(writer);
@@ -324,15 +375,36 @@ public final class PatchSmokeChatCopy {
      * 检查方法中是否已经存在指定运行时钩子调用。
      *
      * @param method 待检查的方法
+     * @param hookOwner 钩子类的 JVM 所有者名称
      * @param hookMethod 钩子方法名称
      * @return 是否已经注入对应调用
      */
-    private static boolean containsHookInvocation(MethodNode method, String hookMethod) {
+    private static boolean containsHookInvocation(MethodNode method, String hookOwner, String hookMethod) {
         for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null; instruction = instruction.getNext()) {
             if (instruction instanceof MethodInsnNode) {
                 MethodInsnNode invocation = (MethodInsnNode) instruction;
 
-                if (HOOK_OWNER.equals(invocation.owner) && hookMethod.equals(invocation.name)) {
+                if (hookOwner.equals(invocation.owner) && hookMethod.equals(invocation.name)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * 检查方法中是否已经存在任一运行时钩子调用。
+     *
+     * @param method 待检查的方法
+     * @return 是否已经注入聊天复制或 AutoGG 钩子
+     */
+    private static boolean containsRuntimeHookInvocation(MethodNode method) {
+        for (AbstractInsnNode instruction = method.instructions.getFirst(); instruction != null; instruction = instruction.getNext()) {
+            if (instruction instanceof MethodInsnNode) {
+                MethodInsnNode invocation = (MethodInsnNode) instruction;
+
+                if (CHAT_COPY_HOOK_OWNER.equals(invocation.owner) || AUTO_GG_HOOK_OWNER.equals(invocation.owner)) {
                     return true;
                 }
             }
@@ -366,7 +438,7 @@ public final class PatchSmokeChatCopy {
             InsnList trackingInstructions = new InsnList();
             trackingInstructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
             trackingInstructions.add(new VarInsnNode(Opcodes.ALOAD, 10));
-            trackingInstructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, "rememberCandidateLine", "(Ljava/lang/Object;Ljava/lang/Object;)V", false));
+            trackingInstructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, CHAT_COPY_HOOK_OWNER, "rememberCandidateLine", "(Ljava/lang/Object;Ljava/lang/Object;)V", false));
             lookupMethod.instructions.insert(instruction, trackingInstructions); // 在 ChatLine 赋值后立即记录，避免读取未初始化局部变量
             return;
         }
@@ -401,13 +473,34 @@ public final class PatchSmokeChatCopy {
         prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "org/lwjgl/input/Mouse", "getY", "()I", false));
         prefix.add(new MethodInsnNode(Opcodes.INVOKEVIRTUAL, "net/minecraft/client/gui/GuiNewChat", "getChatComponent", "(II)Lnet/minecraft/util/IChatComponent;", false));
         prefix.add(new VarInsnNode(Opcodes.ILOAD, 3));
-        prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, HOOK_OWNER, "tryCopy", "(Ljava/lang/Object;Ljava/lang/Object;I)Z", false));
+        prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, CHAT_COPY_HOOK_OWNER, "tryCopy", "(Ljava/lang/Object;Ljava/lang/Object;I)Z", false));
         prefix.add(new JumpInsnNode(Opcodes.IFEQ, continueOriginalHandling));
         prefix.add(new InsnNode(Opcodes.RETURN));
         prefix.add(continueOriginalHandling);
         prefix.add(createInitialFrame(classNode));
 
         mouseClickMethod.instructions.insert(prefix); // 在原始组件点击、输入框和父类处理前优先尝试复制
+    }
+
+    /**
+     * 在原 AutoGG 处理前优先处理其遗漏的 Hypixel 结算规则。
+     *
+     * @param classNode 当前 AutoGG 类节点
+     * @param autoGGMethod AutoGG 聊天事件方法
+     */
+    private static void injectAutoGGHandling(ClassNode classNode, MethodNode autoGGMethod) {
+        LabelNode continueOriginalHandling = new LabelNode();
+        InsnList prefix = new InsnList();
+
+        prefix.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        prefix.add(new VarInsnNode(Opcodes.ALOAD, 1));
+        prefix.add(new MethodInsnNode(Opcodes.INVOKESTATIC, AUTO_GG_HOOK_OWNER, "trySend", "(Ljava/lang/Object;Ljava/lang/Object;)Z", false));
+        prefix.add(new JumpInsnNode(Opcodes.IFEQ, continueOriginalHandling));
+        prefix.add(new InsnNode(Opcodes.RETURN));
+        prefix.add(continueOriginalHandling);
+        prefix.add(createAutoGGInitialFrame(classNode));
+
+        autoGGMethod.instructions.insert(prefix); // Hypixel 结算命中后跳过旧方法中遗漏该数组的逻辑
     }
 
     /**
@@ -418,6 +511,16 @@ public final class PatchSmokeChatCopy {
      */
     private static FrameNode createInitialFrame(ClassNode classNode) {
         return new FrameNode(Opcodes.F_NEW, 4, new Object[] {classNode.name, Opcodes.INTEGER, Opcodes.INTEGER, Opcodes.INTEGER}, 0, new Object[0]);
+    }
+
+    /**
+     * 为新增 AutoGG 跳转目标创建与事件方法入口一致的 StackMap Frame。
+     *
+     * @param classNode 当前 AutoGG 类节点
+     * @return 可写入事件继续分支的初始栈帧
+     */
+    private static FrameNode createAutoGGInitialFrame(ClassNode classNode) {
+        return new FrameNode(Opcodes.F_NEW, 2, new Object[] {classNode.name, "icu/hanabi/smoke/events/Misc/EventChat"}, 0, new Object[0]);
     }
 
     /**
